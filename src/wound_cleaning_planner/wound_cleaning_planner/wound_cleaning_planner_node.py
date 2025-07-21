@@ -14,6 +14,7 @@ import traceback
 import tf2_geometry_msgs
 import os
 from datetime import datetime
+from surface_normals import SurfaceNormalEstimator
 
 
 class WoundCleaningPlanner:
@@ -219,175 +220,138 @@ class WoundCleaningPlanner:
         
         return q
 
-    def generate_tool_orientation(self, pixel_point, normal):
-        
-        # Use the incoming pixel point calculation vector 
-        z_axis = -normal / np.linalg.norm(normal)
-        
-        # Generate vertical x-axis
-        if abs(z_axis[2]) > 0.99:
-            x_axis = np.array([1, 0, 0])
-        else:
-            x_axis = np.array([z_axis[1], -z_axis[0], 0])
-            x_axis = x_axis / np.linalg.norm(x_axis)
-        
-        # Calculate the y-axis
-        y_axis = np.cross(z_axis, x_axis)
-        
-        rot_matrix = np.column_stack((x_axis, y_axis, z_axis))
-        
-        return self.rotation_matrix_to_quaternion(rot_matrix)
     
-
     def generate_cleaning_path(self, mask, depth_map, num_rays=16):
-   
         print("Starting simplified path planning...")
-
         center_result = self.find_wound_center(mask)
         if center_result is None:
             print("No wound center found")
             return None
-
+        
         center_2d, main_contour = center_result
         print(f"Wound center found at: {center_2d}")
-
+        
         if self.camera_matrix is None:
             fx = fy = 525.0
             cx, cy = depth_map.shape[1] / 2, depth_map.shape[0] / 2
             self.camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-
+        
         angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False)
-
         all_path_points_3d = []
         all_segment_types = []
         all_orientations = []
-
+        
         center_depth = self.get_depth_at_pixel(depth_map, center_2d)
         if center_depth is None or center_depth <= 0:
             print("Invalid center depth")
             return None
-
+        
         center_3d = self.pixel_to_3d(center_2d, center_depth)
         print(f"Wound center 3D: {center_3d}")
-
-        default_rot = np.eye(3)
-        default_rot[:, 2] *= -1   
-        default_orientation = self.rotation_matrix_to_quaternion(default_rot)
-
-
+        
+        # Default orientation matrix
+        default_orientation = np.eye(3)
+        default_orientation[2, 2] = -1  # Flip z-axis
+        
         valid_rays = 0
-
+        
+        # Generate all path points first
         for i, angle in enumerate(angles):
             ray_direction = np.array([np.cos(angle), np.sin(angle)])
             edge_2d = self.find_ray_intersection(center_2d, ray_direction, mask)
-
             if edge_2d is not None:
                 ray_points_result = self.generate_ray_path_points(center_2d, edge_2d, depth_map)
-
                 if ray_points_result is not None and len(ray_points_result[0]) > 0:
                     ray_points = ray_points_result[0]
                     valid_rays += 1
-
+                    
                     # Approach
                     approach_point = ray_points[0] + np.array([0, 0, 0.02])
                     all_path_points_3d.append(approach_point)
                     all_segment_types.append('approach')
-                    all_orientations.append(default_orientation)
-
+                    
                     # Cleaning path
                     for point in ray_points:
                         all_path_points_3d.append(point)
                         all_segment_types.append('cleaning')
-
-                        ratio = np.linalg.norm(point - ray_points[0]) / np.linalg.norm(ray_points[-1] - ray_points[0]) if len(ray_points) > 1 else 0
-                        pixel_2d = center_2d + (edge_2d - center_2d) * ratio
-
-    
-                        normal = self.calculate_surface_normal(depth_map, pixel_2d)
-                        if normal[2] < 0:
-                            normal = -normal
-                        normal = normal / np.linalg.norm(normal)
-
-                        orientation = self.generate_tool_orientation(pixel_2d, -normal)  
-                        all_orientations.append(orientation)
-
+                    
                     # Retreat
                     retreat_point = ray_points[-1] + np.array([0, 0, 0.01])
                     all_path_points_3d.append(retreat_point)
                     all_segment_types.append('retreat')
-                    all_orientations.append(default_orientation)
-
+        
         if len(all_path_points_3d) == 0:
             print("No valid path points generated")
             return None
-
+        
         print(f"Generated {valid_rays} valid rays out of {num_rays}")
+        
+        normal_estimator = SurfaceNormalEstimator()
+        
+        all_path_points_3d = np.array(all_path_points_3d)
+        
+        cleaning_indices = [i for i, seg_type in enumerate(all_segment_types) if seg_type == 'cleaning']
+        cleaning_points = all_path_points_3d[cleaning_indices]
+        
+        print(f"Calculating surface normals for {len(cleaning_points)} cleaning points...")
+        
+        all_orientations = [default_orientation.copy() for _ in range(len(all_path_points_3d))]
+        
+        if len(cleaning_points) >= 10:  
+            try:
+        
+                cleaning_normals = normal_estimator.calculate_surface_normals(
+                    points_3d=cleaning_points,
+                    radius=0.02,
+                    min_points=20
+                )
+                
+                unified_normals = normal_estimator.unify_normal_directions(cleaning_normals)
+                
+                cleaning_orientations = normal_estimator.generate_consistent_orientations(
+                    positions=cleaning_points,
+                    normals=unified_normals
+                )
+                
+                for i, cleaning_idx in enumerate(cleaning_indices):
+                    all_orientations[cleaning_idx] = cleaning_orientations[i]
+                
+                print(f"Successfully calculated orientations for {len(cleaning_orientations)} cleaning points")
+                
+            except Exception as e:
+                print(f"Warning: Failed to calculate surface normals: {e}")
+                print("Using default orientations for all points")
+        else:
+            print(f"Insufficient cleaning points ({len(cleaning_points)}) for normal calculation, using default orientations")
+        
+        print("Smoothing orientations...")
+        try:
+            smoothed_orientations = normal_estimator.smooth_orientations(
+                orientations=all_orientations,
+                smoothing_factor=0.3
+            )
+            all_orientations = smoothed_orientations
+            print("Orientation smoothing completed")
+        except Exception as e:
+            print(f"Warning: Failed to smooth orientations: {e}")
+        
+        all_orientations_quaternions = []
+        for orientation_matrix in all_orientations:
+            try:
+                quaternion = self.rotation_matrix_to_quaternion(orientation_matrix)
+                all_orientations_quaternions.append(quaternion)
+            except:
+                default_quat = self.rotation_matrix_to_quaternion(default_orientation)
+                all_orientations_quaternions.append(default_quat)
+        
+        print(f"Final result: {len(all_path_points_3d)} points with calculated orientations")
+        
         return {
-            'path_3d': np.array(all_path_points_3d),
-            'orientations': all_orientations,
-            'segment_types': all_segment_types
+            'path_3d': all_path_points_3d,
+            'orientations': all_orientations_quaternions,
+            'segment_types': all_segment_types,
         }
-
     
-    def calculate_surface_normal(self, depth_map, pixel_point, smooth_kernel_size=5):
-      
-        x, y = int(pixel_point[0]), int(pixel_point[1])
-        
-        
-        if x < smooth_kernel_size or x >= depth_map.shape[1] - smooth_kernel_size or \
-        y < smooth_kernel_size or y >= depth_map.shape[0] - smooth_kernel_size:
-            return np.array([0, 0, 1])  
-        
-        
-        kernel_size = smooth_kernel_size
-        
-      
-        local_region = depth_map[y-kernel_size:y+kernel_size+1, x-kernel_size:x+kernel_size+1]
-        
-     
-        valid_mask = local_region > 0
-        if not np.any(valid_mask):
-            return np.array([0, 0, 1])
-        
-    
-        median_depth = np.median(local_region[valid_mask])
-        local_region[~valid_mask] = median_depth
-        
-       
-        smoothed_region = cv2.GaussianBlur(local_region, (5, 5), 1.0)
-        
-      
-        dzdx = cv2.Sobel(smoothed_region, cv2.CV_32F, 1, 0, ksize=3)
-        dzdy = cv2.Sobel(smoothed_region, cv2.CV_32F, 0, 1, ksize=3)
-        
-      
-        center_idx = kernel_size
-        grad_x = dzdx[center_idx, center_idx]
-        grad_y = dzdy[center_idx, center_idx]
-        
-       
-        if self.camera_matrix is not None:
-            fx = self.camera_matrix[0, 0]
-            fy = self.camera_matrix[1, 1]
-            
-    
-            depth_at_point = smoothed_region[center_idx, center_idx]
-            grad_x_3d = grad_x * depth_at_point / fx
-            grad_y_3d = grad_y * depth_at_point / fy
-            
-            normal = np.array([-grad_x_3d, -grad_y_3d, 1])
-        else:
-            normal = np.array([-grad_x, -grad_y, 1])
-        
-    
-        norm = np.linalg.norm(normal)
-        if norm > 0:
-            normal = normal / norm
-        else:
-            normal = np.array([0, 0, 1])
-        
-        return normal
-
 
 class CoordinateTransformer:
     def __init__(self, node):
