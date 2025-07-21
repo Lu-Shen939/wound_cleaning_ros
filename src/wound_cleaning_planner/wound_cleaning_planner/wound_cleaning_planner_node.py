@@ -16,98 +16,6 @@ import os
 from datetime import datetime
 
 
-
-class VelocityProfile:
-      
-    def __init__(self, cleaning_speed=0.005, transition_speed=0.02, 
-                 retreat_speed=0.015, approach_speed=0.01,
-                 max_acceleration=0.01, min_segment_time=0.1):
-        
-        self.cleaning_speed = cleaning_speed
-        self.transition_speed = transition_speed
-        self.retreat_speed = retreat_speed  
-        self.approach_speed = approach_speed  
-        self.max_acceleration = max_acceleration
-        self.min_segment_time = min_segment_time
-    
-    def calculate_path_timing(self, path_3d, segment_types):
-        if len(path_3d) < 2:
-            return [0.0], [0.0]
-        
-        timestamps = [0.0]
-        velocities = []
-        current_time = 0.0
-        
-        for i in range(len(path_3d) - 1):
-            segment_distance = np.linalg.norm(path_3d[i+1] - path_3d[i])
-            
-            if i < len(segment_types):
-                segment_type = segment_types[i]
-            else:
-                segment_type = 'cleaning'
-            
-            # 根据段类型设置目标速度
-            if segment_type == 'approach':
-                target_speed = self.approach_speed
-            elif segment_type == 'cleaning':
-                target_speed = self.cleaning_speed
-            elif segment_type == 'retreat':  
-                target_speed = self.retreat_speed
-            elif segment_type == 'back_to_center':  
-                target_speed = self.transition_speed
-            else:  # 其他过渡段
-                target_speed = self.transition_speed
-            
-            if segment_distance > 0:
-                segment_time = max(segment_distance / target_speed, self.min_segment_time)
-                actual_velocity = segment_distance / segment_time
-            else:
-                segment_time = self.min_segment_time
-                actual_velocity = 0.0
-            
-            current_time += segment_time
-            timestamps.append(current_time)
-            velocities.append(actual_velocity)
-        
-        return timestamps, velocities
-    
-    def apply_smooth_acceleration(self, timestamps, velocities):
-        
-        if len(velocities) < 2:
-            return timestamps, velocities
-        
-        smoothed_timestamps = [timestamps[0]]
-        smoothed_velocities = []
-        current_time = timestamps[0]
-        current_velocity = 0.0
-        
-        for i, target_velocity in enumerate(velocities):
-            
-            velocity_change = target_velocity - current_velocity
-            
-            if abs(velocity_change) > 0:
-                accel_time = abs(velocity_change) / self.max_acceleration
-                
-            
-                if accel_time > 0.1: 
-                
-                    accel_end_time = current_time + accel_time
-                    smoothed_timestamps.append(accel_end_time)
-                    current_time = accel_end_time
-                    current_velocity = target_velocity
-            
-            
-            if i + 1 < len(timestamps):
-                remaining_time = timestamps[i + 1] - current_time
-                if remaining_time > 0:
-                    current_time += remaining_time
-                    smoothed_timestamps.append(current_time)
-            
-            smoothed_velocities.append(current_velocity)
-        
-        return smoothed_timestamps, smoothed_velocities
-
-
 class WoundCleaningPlanner:
     def __init__(self, tool_diameter=0.01, coverage_overlap=0.2, edge_extension=0.005):
         self.tool_diameter = tool_diameter
@@ -115,13 +23,7 @@ class WoundCleaningPlanner:
         self.edge_extension = edge_extension
         self.camera_matrix = None
         self.dist_coeffs = None
-        self.velocity_planner = VelocityProfile(
-            cleaning_speed=0.003,    
-            transition_speed=0.015,  
-            max_acceleration=0.008,  
-            min_segment_time=0.2     
-        )
-
+        
     def set_camera_params(self, camera_matrix, dist_coeffs):
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
@@ -337,166 +239,96 @@ class WoundCleaningPlanner:
         return self.rotation_matrix_to_quaternion(rot_matrix)
     
 
-    def generate_cleaning_path(self, mask, depth_map, num_rays=24, retreat_height=0.005):
+    def generate_cleaning_path(self, mask, depth_map, num_rays=16):
    
-        print(f"Starting path generation with mask shape: {mask.shape}, depth shape: {depth_map.shape}")
-    
+        print("Starting simplified path planning...")
+
         center_result = self.find_wound_center(mask)
         if center_result is None:
             print("No wound center found")
             return None
-            
-        center_2d_depth, main_contour = center_result
-        print(f"Wound center found at: {center_2d_depth}")
-        
-        _, mask_binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-        
-        mask_scaled = cv2.resize(mask_binary, (depth_map.shape[1], depth_map.shape[0]))
-        
-        contour_area = cv2.contourArea(main_contour)
-        center_depth = self.get_depth_at_pixel(depth_map, center_2d_depth)
 
-        if center_depth is None or center_depth <= 0:
-            print("Invalid center depth, cannot convert pixel units")
-            return None
-        
-        fx = self.camera_matrix[0, 0]
-        pixel_size_m = center_depth / fx
-        
-        equivalent_radius_pixels = np.sqrt(contour_area / np.pi)
-        equivalent_radius_m = equivalent_radius_pixels * pixel_size_m
-        circumference_m = 2 * np.pi * equivalent_radius_m
-        
-        effective_width = self.tool_diameter * (1 - self.coverage_overlap)
-        num_rays = max(8, int(circumference_m / effective_width))
-    
-        print(f"Using {num_rays} rays for area {contour_area}")
-        
+        center_2d, main_contour = center_result
+        print(f"Wound center found at: {center_2d}")
 
-        angles = np.linspace(0, 2*np.pi, num_rays, endpoint=False)
+        if self.camera_matrix is None:
+            fx = fy = 525.0
+            cx, cy = depth_map.shape[1] / 2, depth_map.shape[0] / 2
+            self.camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+
+        angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False)
 
         all_path_points_3d = []
-        all_orientations = []
         all_segment_types = []
-        
-        center_3d = self.pixel_to_3d(center_2d_depth, center_depth)
-        center_normal = self.calculate_surface_normal(depth_map, center_2d_depth)
-        
-        if center_normal[2] < 0:
-            center_normal = -center_normal
-        center_normal = center_normal / np.linalg.norm(center_normal)  # 归一化
-        
-        center_orientation = self.generate_tool_orientation(center_2d_depth, center_normal)
-        
+        all_orientations = []
+
+        center_depth = self.get_depth_at_pixel(depth_map, center_2d)
+        if center_depth is None or center_depth <= 0:
+            print("Invalid center depth")
+            return None
+
+        center_3d = self.pixel_to_3d(center_2d, center_depth)
+        print(f"Wound center 3D: {center_3d}")
+
+        default_rot = np.eye(3)
+        default_rot[:, 2] *= -1   
+        default_orientation = self.rotation_matrix_to_quaternion(default_rot)
+
+
         valid_rays = 0
-        
-        for ray_idx, angle in enumerate(angles):
+
+        for i, angle in enumerate(angles):
             ray_direction = np.array([np.cos(angle), np.sin(angle)])
-            
-           
-            edge_2d_scaled = self.find_ray_intersection(center_2d_depth, ray_direction, mask_scaled)
-            
-            if edge_2d_scaled is not None:
-              
-                ray_result = self.generate_ray_path_points(
-                    center_2d_depth, edge_2d_scaled, depth_map
-                )
-                
-                if ray_result[0] is not None and len(ray_result[0]) > 0:
-                    ray_points_3d, ray_segment_types = ray_result
+            edge_2d = self.find_ray_intersection(center_2d, ray_direction, mask)
+
+            if edge_2d is not None:
+                ray_points_result = self.generate_ray_path_points(center_2d, edge_2d, depth_map)
+
+                if ray_points_result is not None and len(ray_points_result[0]) > 0:
+                    ray_points = ray_points_result[0]
                     valid_rays += 1
 
-                    
-                    ray_path, ray_orientations, ray_types = self._create_complete_ray_path(
-                        ray_points_3d, 
-                        center_2d_depth, 
-                        edge_2d_scaled, 
-                        center_3d,
-                        center_normal,
-                        center_orientation,
-                        depth_map, 
-                        retreat_height,
-                        is_last_ray=(ray_idx == len(angles) - 1)
-                    )
-                    
-                  
-                    all_path_points_3d.extend(ray_path)
-                    all_orientations.extend(ray_orientations)
-                    all_segment_types.extend(ray_types)
-        
-        print(f"Generated {len(all_path_points_3d)} points from {valid_rays} valid rays")
-        
+                    # Approach
+                    approach_point = ray_points[0] + np.array([0, 0, 0.02])
+                    all_path_points_3d.append(approach_point)
+                    all_segment_types.append('approach')
+                    all_orientations.append(default_orientation)
+
+                    # Cleaning path
+                    for point in ray_points:
+                        all_path_points_3d.append(point)
+                        all_segment_types.append('cleaning')
+
+                        ratio = np.linalg.norm(point - ray_points[0]) / np.linalg.norm(ray_points[-1] - ray_points[0]) if len(ray_points) > 1 else 0
+                        pixel_2d = center_2d + (edge_2d - center_2d) * ratio
+
+    
+                        normal = self.calculate_surface_normal(depth_map, pixel_2d)
+                        if normal[2] < 0:
+                            normal = -normal
+                        normal = normal / np.linalg.norm(normal)
+
+                        orientation = self.generate_tool_orientation(pixel_2d, -normal)  
+                        all_orientations.append(orientation)
+
+                    # Retreat
+                    retreat_point = ray_points[-1] + np.array([0, 0, 0.01])
+                    all_path_points_3d.append(retreat_point)
+                    all_segment_types.append('retreat')
+                    all_orientations.append(default_orientation)
+
         if len(all_path_points_3d) == 0:
             print("No valid path points generated")
             return None
-        
-       
-        timestamps, velocities = self.velocity_planner.calculate_path_timing(
-            np.array(all_path_points_3d), all_segment_types
-        )
-        
-    
-        smooth_timestamps, smooth_velocities = self.velocity_planner.apply_smooth_acceleration(
-            timestamps, velocities
-        )
-            
+
+        print(f"Generated {valid_rays} valid rays out of {num_rays}")
         return {
             'path_3d': np.array(all_path_points_3d),
             'orientations': all_orientations,
-            'num_rays': valid_rays,
-            'timestamps': smooth_timestamps,
-            'velocities': smooth_velocities,
             'segment_types': all_segment_types
         }
 
-    def _create_complete_ray_path(self, ray_points_3d, center_2d, edge_2d, center_3d, 
-                            center_normal, center_orientation, depth_map, 
-                            retreat_height, is_last_ray=False):
-        ray_path = []
-        ray_orientations = []
-        ray_types = []
-        
-        for i, point_3d in enumerate(ray_points_3d):
-            ray_path.append(point_3d)
-            
-            ratio = i / (len(ray_points_3d) - 1) if len(ray_points_3d) > 1 else 0
-            pixel_point = center_2d + (edge_2d - center_2d) * ratio
-            normal = self.calculate_surface_normal(depth_map, pixel_point)
-            
-            if normal[2] < 0:
-                normal = -normal
-            normal = normal / np.linalg.norm(normal)
-            
-            orientation = self.generate_tool_orientation(pixel_point, normal)
-            ray_orientations.append(orientation)
-            
-            if i == 0:
-                ray_types.append('approach')
-            elif i == len(ray_points_3d) - 1:
-                ray_types.append('cleaning')
-            else:
-                ray_types.append('cleaning')
-        
-        
-        vertical_retreat = np.array([0, 0, 1])
-        
-        edge_point_raised = ray_points_3d[-1] + vertical_retreat * retreat_height
-        ray_path.append(edge_point_raised)
-        ray_orientations.append(ray_orientations[-1])
-        ray_types.append('retreat')
-        
-        center_raised = center_3d + vertical_retreat * retreat_height
-        ray_path.append(center_raised)
-        ray_orientations.append(center_orientation)
-        ray_types.append('return_to_center')
-        
-        if not is_last_ray:
-            ray_path.append(center_3d)
-            ray_orientations.append(center_orientation)
-            ray_types.append('approach')
-        
-        return ray_path, ray_orientations, ray_types
-
+    
     def calculate_surface_normal(self, depth_map, pixel_point, smooth_kernel_size=5):
       
         x, y = int(pixel_point[0]), int(pixel_point[1])
@@ -556,20 +388,6 @@ class WoundCleaningPlanner:
         
         return normal
 
-    def debug_retreat_direction(self, edge_point, edge_normal, retreat_height):
-     
-        print(f"Edge point: {edge_point}")
-        print(f"Edge normal: {edge_normal}")
-        print(f"Retreat height: {retreat_height}")
-        
-        retreat_vector = edge_normal * retreat_height
-        new_position = edge_point + retreat_vector
-        
-        print(f"Retreat vector: {retreat_vector}")
-        print(f"New position: {new_position}")
-        print(f"Movement distance: {np.linalg.norm(retreat_vector)}")
-        
-        return new_position
 
 class CoordinateTransformer:
     def __init__(self, node):
@@ -659,14 +477,6 @@ class WoundCleaningPlannerNode(Node):
             coverage_overlap=self.get_parameter('coverage_overlap').value
         )
 
-        self.planner.velocity_planner = VelocityProfile(
-            cleaning_speed=self.get_parameter('cleaning_speed').value,
-            transition_speed=self.get_parameter('transition_speed').value,
-            retreat_speed=self.get_parameter('retreat_speed').value,
-            approach_speed=self.get_parameter('approach_speed').value,
-            max_acceleration=self.get_parameter('max_acceleration').value
-        )
-        
         self.transformer = CoordinateTransformer(self)
         
         self.create_subscription(Image, '/segmentation_result', self.mask_callback, 10)
@@ -674,11 +484,8 @@ class WoundCleaningPlannerNode(Node):
         self.create_subscription(CameraInfo, '/depth/camera_info', self.camera_info_callback, 10)
         self.create_subscription(Empty, '/start_cleaning', self.start_cleaning_callback, 10)
         
-        self.path_pub = self.create_publisher(PoseArray, '/cleaning_path', 10)
-        self.times_pub = self.create_publisher(Float32MultiArray, '/path_times', 10)
-        self.velocities_pub = self.create_publisher(Float32MultiArray, '/path_velocities', 10)
+        self.path_pub = self.create_publisher(Float32MultiArray, '/cleaning_path', 10)
 
-        
         self.current_mask = None
         self.current_depth = None
         self.camera_info = None
@@ -773,8 +580,7 @@ class WoundCleaningPlannerNode(Node):
             result = self.planner.generate_cleaning_path(
                 self.current_mask,
                 self.current_depth,
-                num_rays=self.get_parameter('num_rays').value,
-                retreat_height=self.get_parameter('retreat_height').value
+                num_rays=self.get_parameter('num_rays').value
             )
             
             
@@ -798,43 +604,40 @@ class WoundCleaningPlannerNode(Node):
                 self.get_logger().warn("Using camera frame path directly")
                 base_path = result['path_3d']
                 
-            self.publish_path(base_path, result['orientations'],result['timestamps'], result['velocities'])
+            self.publish_path(base_path, result['path_3d'] ,result['orientations'],result['segment_types'])
             
         except Exception as e:
             self.get_logger().error(f"Path planning failed: {str(e)}")
             self.get_logger().error(f"Traceback: {traceback.format_exc()}")
 
-    def publish_path(self, path_3d, orientations,timestamps, velocities):
+    def publish_path(self, path_3d, orientations,segment_types):
         
-        path_msg = PoseArray()
-        path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = self.target_frame
-        
-        for i, point in enumerate(path_3d):
-            pose = Pose()
-            pose.position = Point(x=float(point[0]), y=float(point[1]), z=float(point[2]))
-            
-            if i < len(orientations):
-                q = orientations[i]
-                pose.orientation = Quaternion(x=float(q[1]), y=float(q[2]), z=float(q[3]), w=float(q[0]))
-            else:
-                pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-                
-            path_msg.poses.append(pose)
-        
-        self.path_pub.publish(path_msg)
-        
-        times_msg = Float32MultiArray()
-        times_msg.data = [float(t) for t in timestamps]
-        self.times_pub.publish(times_msg)
-        
-        velocities_msg = Float32MultiArray()
-        velocities_msg.data = [float(v) for v in velocities]
-        self.velocities_pub.publish(velocities_msg)
-        
-        self.get_logger().info(f"Published path with {len(path_3d)} waypoints")
-        self.get_logger().info(f"Speed profile: {len(velocities)} segments, avg cleaning speed: {np.mean([v for v in velocities if v < 0.01]):.4f}m/s")
-        self.get_logger().info(f"Total trajectory time: {timestamps[-1]:.2f}s")
+        raw_msg = Float32MultiArray()
+        data = []
+
+        SEGMENT_TYPE_MAP = {
+            'approach': 0,
+            'cleaning': 1,
+            'retreat': 2,
+        }
+
+        for i in range(len(path_3d)):
+            point = path_3d[i]
+            orientation = orientations[i] if i < len(orientations) else [1, 0, 0, 0]
+            segment_str = segment_types[i] if i < len(segment_types) else 'cleaning'
+            segment_index = SEGMENT_TYPE_MAP.get(segment_str, 1)  
+
+           
+            data.extend([
+                float(point[0]), float(point[1]), float(point[2]),
+                float(orientation[1]), float(orientation[2]), float(orientation[3]), float(orientation[0]),
+                float(segment_index)
+            ])
+
+        raw_msg.data = data
+        self.raw_path_pub.publish(raw_msg)
+        self.get_logger().info(f"Published raw Float32MultiArray path with {len(path_3d)} points")
+
 
 def main(args=None):
     rclpy.init(args=args)
