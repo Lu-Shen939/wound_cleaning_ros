@@ -188,6 +188,39 @@ class WoundCleaningPlanner:
         return (np.array(ray_3d_points) if ray_3d_points else None, segment_types)
     
 
+    def rotation_matrix_to_quaternion(self, R):
+        
+        q = np.empty(4)
+        trace = np.trace(R)
+        
+        if trace > 0:
+            S = np.sqrt(trace + 1.0) * 2
+            q[0] = 0.25 * S  # w
+            q[1] = (R[2, 1] - R[1, 2]) / S  # x
+            q[2] = (R[0, 2] - R[2, 0]) / S  # y
+            q[3] = (R[1, 0] - R[0, 1]) / S  # z
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            S = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+            q[0] = (R[2, 1] - R[1, 2]) / S
+            q[1] = 0.25 * S
+            q[2] = (R[0, 1] + R[1, 0]) / S
+            q[3] = (R[0, 2] + R[2, 0]) / S
+        elif R[1, 1] > R[2, 2]:
+            S = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+            q[0] = (R[0, 2] - R[2, 0]) / S
+            q[1] = (R[0, 1] + R[1, 0]) / S
+            q[2] = 0.25 * S
+            q[3] = (R[1, 2] + R[2, 1]) / S
+        else:
+            S = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+            q[0] = (R[1, 0] - R[0, 1]) / S
+            q[1] = (R[0, 2] + R[2, 0]) / S
+            q[2] = (R[1, 2] + R[2, 1]) / S
+            q[3] = 0.25 * S
+        
+        return q
+
+    
     def generate_cleaning_path(self, mask, depth_map, num_rays=16):
         print("Starting simplified path planning...")
         center_result = self.find_wound_center(mask)
@@ -302,13 +335,21 @@ class WoundCleaningPlanner:
         except Exception as e:
             print(f"Warning: Failed to smooth orientations: {e}")
         
+        all_orientations_quaternions = []
+        for orientation_matrix in all_orientations:
+            try:
+                quaternion = self.rotation_matrix_to_quaternion(orientation_matrix)
+                all_orientations_quaternions.append(quaternion)
+            except:
+                default_quat = self.rotation_matrix_to_quaternion(default_orientation)
+                all_orientations_quaternions.append(default_quat)
+        
         print(f"Final result: {len(all_path_points_3d)} points with calculated orientations")
         
         return {
             'path_3d': all_path_points_3d,
-            'orientations': all_orientations, 
+            'orientations': all_orientations_quaternions,
             'segment_types': all_segment_types,
-            'num_rays': valid_rays
         }
     
 
@@ -527,15 +568,15 @@ class WoundCleaningPlannerNode(Node):
                 self.get_logger().warn("Using camera frame path directly")
                 base_path = result['path_3d']
                 
-            self.publish_path(base_path, result['orientations'], result['segment_types'])
+            self.publish_path(base_path, result['path_3d'] ,result['orientations'],result['segment_types'])
             
         except Exception as e:
             self.get_logger().error(f"Path planning failed: {str(e)}")
             self.get_logger().error(f"Traceback: {traceback.format_exc()}")
 
-    def publish_path(self, path_3d, orientations, segment_types):
-       
-        msg = Float32MultiArray()
+    def publish_path(self, path_3d, orientations,segment_types):
+        
+        raw_msg = Float32MultiArray()
         data = []
 
         SEGMENT_TYPE_MAP = {
@@ -546,31 +587,20 @@ class WoundCleaningPlannerNode(Node):
 
         for i in range(len(path_3d)):
             point = path_3d[i]
-            
-          
-            if i < len(orientations):
-                rotation_matrix = orientations[i]
-            else:
-                
-                rotation_matrix = np.eye(3)
-                rotation_matrix[2, 2] = -1  # Flip z-axis
-            
+            orientation = orientations[i] if i < len(orientations) else [1, 0, 0, 0]
             segment_str = segment_types[i] if i < len(segment_types) else 'cleaning'
-            segment_index = SEGMENT_TYPE_MAP.get(segment_str, 1)
+            segment_index = SEGMENT_TYPE_MAP.get(segment_str, 1)  
 
            
-            data.extend([float(point[0]), float(point[1]), float(point[2])])
-            
-            for row in range(3):
-                for col in range(3):
-                    data.append(float(rotation_matrix[row, col]))
-            
-            
-            data.append(float(segment_index))
+            data.extend([
+                float(point[0]), float(point[1]), float(point[2]),
+                float(orientation[1]), float(orientation[2]), float(orientation[3]), float(orientation[0]),
+                float(segment_index)
+            ])
 
-        msg.data = data
-        self.path_pub.publish(msg)
-        self.get_logger().info(f"Published path with {len(path_3d)} points (rotation matrices included)")
+        raw_msg.data = data
+        self.raw_path_pub.publish(raw_msg)
+        self.get_logger().info(f"Published raw Float32MultiArray path with {len(path_3d)} points")
 
 
 def main(args=None):
