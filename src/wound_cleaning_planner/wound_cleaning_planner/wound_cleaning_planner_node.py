@@ -217,6 +217,11 @@ class WoundCleaningPlanner:
             q[1] = (R[0, 2] + R[2, 0]) / S
             q[2] = (R[1, 2] + R[2, 1]) / S
             q[3] = 0.25 * S
+
+        norm = np.linalg.norm(q)
+        if norm == 0:
+            raise ValueError("Zero norm quaternion")
+        q /= norm
         
         return q
 
