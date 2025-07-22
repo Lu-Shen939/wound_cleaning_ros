@@ -193,7 +193,7 @@ class WoundCleaningPlanner:
         q = np.empty(4)
         trace = np.trace(R)
         
-        if trace > 0:
+        if trace > 0: 
             S = np.sqrt(trace + 1.0) * 2
             q[0] = 0.25 * S  # w
             q[1] = (R[2, 1] - R[1, 2]) / S  # x
@@ -424,8 +424,8 @@ class WoundCleaningPlannerNode(Node):
         self.declare_parameter('tool_diameter', 0.01)
         self.declare_parameter('coverage_overlap', 0.3)
         self.declare_parameter('num_rays', 24)
-        self.declare_parameter('target_frame', 'camera_base')
-        self.declare_parameter('source_frame', 'depth_camera_link')
+        self.declare_parameter('target_frame', 'ee_link')
+        self.declare_parameter('source_frame', 'camera_optical_frame')
         self.declare_parameter('cleaning_speed', 0.003)    
         self.declare_parameter('transition_speed', 0.015)  
         self.declare_parameter('max_acceleration', 0.008)  
